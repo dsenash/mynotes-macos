@@ -7,13 +7,14 @@ struct Project: Identifiable, Hashable {
     var sort: Int
     var created: Date
     var colorHex: String? = nil
-    /// Битовая маска начертания названия: 1 — жирный, 2 — курсив.
+    /// Битовая маска: 1 — жирный, 2 — курсив (начертание названия), 4 — «скрываемый» проект.
     var fontStyle: Int = 0
     /// Время последнего изменения (для слияния при синхронизации).
     var updated: Date = Date(timeIntervalSince1970: 0)
 
     var isBold: Bool { fontStyle & 1 != 0 }
     var isItalic: Bool { fontStyle & 2 != 0 }
+    var isHideable: Bool { fontStyle & 4 != 0 }
 }
 
 struct NoteMeta: Identifiable, Hashable {

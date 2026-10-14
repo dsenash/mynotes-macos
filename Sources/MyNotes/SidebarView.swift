@@ -111,6 +111,14 @@ struct SidebarView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
             Spacer()
+            Button { store.toggleHiddenMode() } label: {
+                Image(systemName: store.hiddenMode ? "eye.slash" : "eye")
+            }
+            .buttonStyle(.borderless)
+            .help(store.hiddenMode
+                  ? "Скрываемые проекты скрыты. Нажмите, чтобы показать"
+                  : "Скрываемые проекты показаны. Нажмите, чтобы скрыть")
+
             Button { store.promptNewProject(parent: nil) } label: {
                 Image(systemName: "folder.badge.plus")
             }
@@ -273,6 +281,10 @@ struct ProjectRowView: View {
                 Divider()
                 Button("Обычный") { store.setProjectFontStyle(project.id, bold: false, italic: false) }
             }
+            Toggle("Скрываемый", isOn: Binding(
+                get: { project.isHideable },
+                set: { store.setProjectHideable(project.id, $0) }
+            ))
             Menu("Переместить в") {
                 Button("Верхний уровень") { store.moveProject(project.id, to: nil) }
                 let blocked = store.descendants(of: project.id).union([project.id])

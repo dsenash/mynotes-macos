@@ -229,7 +229,7 @@ final class SyncClient {
     static let shared = SyncClient()
 
     private(set) var isRunning = false
-    private let cancelFlag = CancelFlag()
+    private var cancelFlag = CancelFlag()
     private var currentConnection: FramedConnection?
 
     private struct Outcome {
@@ -237,34 +237,37 @@ final class SyncClient {
         var message: String
     }
 
-    /// Главный поток. Показывает модальное окно, ищет устройства, отправляет запросы
-    /// и применяет полученные изменения. Возвращается, когда всё закончено.
+    /// Главный поток. Показывает окно прогресса, ищет устройства, отправляет запросы
+    /// и применяет полученные изменения. Не блокирует главный поток.
     func start() {
         guard !isRunning else { return }
         isRunning = true
+        // Новый флаг на каждый запуск: иначе после «Отмена» повторная синхронизация сразу бы прерывалась.
+        let flag = CancelFlag()
+        cancelFlag = flag
+        currentConnection = nil
 
         let modal = ProgressModal(
             title: "Синхронизация из локальной сети",
             message: "Поиск устройств в локальной сети…"
         )
-        let flag = cancelFlag
         modal.onCancel = { [weak self] in
             flag.set()
             self?.currentConnection?.cancelByUser()
         }
 
         var outcome: Outcome?
-        modal.onClosed = {
+        modal.onClosed = { [weak self] in
+            self?.isRunning = false
+            self?.currentConnection = nil
             if let outcome { Dialogs.info(title: outcome.title, message: outcome.message) }
         }
 
+        modal.show()
         Task { @MainActor in
             outcome = await self.run(modal: modal)
             modal.dismiss()
         }
-        modal.present()   // блокирует до dismiss(); задача выше выполняется внутри модального цикла
-
-        isRunning = false
     }
 
     @MainActor
@@ -290,7 +293,7 @@ final class SyncClient {
         for device in devices {
             if flag.isSet { break }
             modal.update(
-                message: "Запрос отправлен на «\(device.name)». Ожидание подтверждения на этом устройстве…",
+                message: "Запрос отправлен на устройство\n«\(device.name)»\nОжидание подтверждения на этом устройстве…",
                 fraction: nil
             )
             do {

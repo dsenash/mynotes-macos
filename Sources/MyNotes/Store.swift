@@ -15,6 +15,8 @@ final class Store: ObservableObject {
     @Published var expanded: Set<UUID> = []
 
     @Published var showSidebar = true
+    /// true — проекты, помеченные «Скрываемый», скрыты (кнопка с глазом в боковой панели).
+    @Published private(set) var hiddenMode = UserDefaults.standard.bool(forKey: "hiddenMode")
     @Published var sidebarWidth: CGFloat = 270
     @Published var focusSearchTick = 0
 
@@ -97,7 +99,7 @@ final class Store: ObservableObject {
     }
 
     private func restoreTabs() {
-        let known = Set(notes.map(\.id))
+        let known = Set(notes.filter { !isProjectHidden($0.projectID) }.map(\.id))
         let ids = (UserDefaults.standard.stringArray(forKey: "openTabs") ?? [])
             .compactMap(UUID.init(uuidString:))
             .filter { known.contains($0) }
@@ -223,6 +225,58 @@ final class Store: ObservableObject {
                 [.int(Int64(style)), .real(now.timeIntervalSince1970), .text(id.uuidString)]
             )
         }
+    }
+
+    // MARK: - Скрытие проектов
+
+    /// Проект скрыт, если включён режим скрытия и он (или любой его родитель) помечен «Скрываемый».
+    func isProjectHidden(_ id: UUID?) -> Bool {
+        guard hiddenMode else { return false }
+        var current = id
+        var steps = 0
+        while let cid = current, steps < 64 {
+            guard let p = projects.first(where: { $0.id == cid }) else { return false }
+            if p.isHideable { return true }
+            current = p.parentID
+            steps += 1
+        }
+        return false
+    }
+
+    func toggleHiddenMode() {
+        hiddenMode.toggle()
+        UserDefaults.standard.set(hiddenMode, forKey: "hiddenMode")
+        afterHiddenChange()
+    }
+
+    func setProjectHideable(_ id: UUID, _ value: Bool) {
+        guard let i = projects.firstIndex(where: { $0.id == id }) else { return }
+        let style = value ? (projects[i].fontStyle | 4) : (projects[i].fontStyle & ~4)
+        let now = Date()
+        projects[i].fontStyle = style
+        projects[i].updated = now
+        attempt {
+            try db.execute(
+                "UPDATE projects SET font_style = ?, updated = ? WHERE id = ?",
+                [.int(Int64(style)), .real(now.timeIntervalSince1970), .text(id.uuidString)]
+            )
+        }
+        afterHiddenChange()
+    }
+
+    /// Скрытые заметки не должны оставаться открытыми во вкладках и в результатах поиска.
+    private func afterHiddenChange() {
+        guard hiddenMode else {
+            if !searchText.isEmpty { runSearch() }
+            return
+        }
+        for id in openTabs {
+            if let note = notes.first(where: { $0.id == id }), isProjectHidden(note.projectID) {
+                closeTab(id)
+            }
+        }
+        if let selected = selectedProject, isProjectHidden(selected) { selectedProject = nil }
+        if !searchText.isEmpty { runSearch() }
     }
 
     func projectName(_ id: UUID) -> String {
@@ -389,6 +443,7 @@ final class Store: ObservableObject {
 
         func walk(_ parent: UUID?, _ depth: Int) {
             for p in childProjects[parent] ?? [] {
+                if hiddenMode && p.isHideable { continue }
                 out.append(.project(p, depth))
                 if expanded.contains(p.id) { walk(p.id, depth + 1) }
             }
@@ -412,7 +467,7 @@ final class Store: ObservableObject {
         let ids = Set(hits.filter {
             $0.1.localizedCaseInsensitiveContains(query) || $0.2.localizedCaseInsensitiveContains(query)
         }.map { $0.0 })
-        searchResults = notes.filter { ids.contains($0.id.uuidString) }
+        searchResults = notes.filter { ids.contains($0.id.uuidString) && !isProjectHidden($0.projectID) }
     }
 
     func focusSearch() {

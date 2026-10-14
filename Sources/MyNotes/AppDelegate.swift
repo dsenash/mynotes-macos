@@ -282,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             item("Ссылка…", #selector(fmtLink), "k"),
             item("Вставить изображение…", #selector(fmtImage), "i", [.command, .shift]),
             item("Вложить файл…", #selector(fmtFile), "a", [.command, .shift]),
+            item("Нарисовать рисунок…", #selector(fmtDrawing), "d", [.command, .option]),
             .separator(),
             fonts,
             std("Цвета", #selector(NSApplication.orderFrontColorPanel(_:)), "c", [.command, .shift])
@@ -350,6 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc private func fmtLink() { editor.insertLink() }
     @objc private func fmtImage() { editor.insertImages() }
     @objc private func fmtFile() { editor.insertFiles() }
+    @objc private func fmtDrawing() { editor.insertDrawing() }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard let action = menuItem.action else { return true }
@@ -363,7 +365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case #selector(fmtBold), #selector(fmtItalic), #selector(fmtUnderline), #selector(fmtStrike),
              #selector(fmtTitle), #selector(fmtHeading), #selector(fmtSubheading), #selector(fmtBody),
              #selector(fmtBullets), #selector(fmtChecklist), #selector(fmtAlignLeft), #selector(fmtAlignCenter),
-             #selector(fmtAlignRight), #selector(fmtLink), #selector(fmtImage), #selector(fmtFile):
+             #selector(fmtAlignRight), #selector(fmtLink), #selector(fmtImage), #selector(fmtFile), #selector(fmtDrawing):
             return store.activeTab != nil
         default:
             return true

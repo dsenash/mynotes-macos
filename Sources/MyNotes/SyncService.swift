@@ -184,16 +184,17 @@ final class SyncService: ObservableObject {
 
         // Модальное окно с процентами.
         let modal = await MainActor.run { () -> ProgressModal in
-            let m = ProgressModal(title: "Синхронизация проектов", message: "Отправка проектов на «\(name)»")
+            let m = ProgressModal(title: "Синхронизация проектов", message: "Отправка проектов на устройство\n«\(name)»")
             m.onCancel = { framed.cancelByUser() }
             m.update(fraction: 0)
-            DispatchQueue.main.async { m.present() }
+            m.show()
             return m
         }
 
         do {
             try await stream(package, to: framed, modal: modal)
             await MainActor.run {
+                self.busy = false
                 modal.onClosed = {
                     Dialogs.info(
                         title: "Синхронизация завершена",
@@ -201,18 +202,17 @@ final class SyncService: ObservableObject {
                     )
                 }
                 modal.dismiss()
-                self.busy = false
             }
         } catch {
             try? await framed.sendJSONAsync(.error, ErrorMessage(message: error.localizedDescription))
             await MainActor.run {
+                self.busy = false
                 if !error.isUserCancel {
                     modal.onClosed = {
                         Dialogs.info(title: "Синхронизация не выполнена", message: error.localizedDescription)
                     }
                 }
                 modal.dismiss()
-                self.busy = false
             }
         }
     }

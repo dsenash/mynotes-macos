@@ -5,13 +5,15 @@ import AppKit
 /// Все методы — только из главного потока.
 final class ProgressModal: NSObject {
     private let window: NSWindow
-    private let titleLabel = NSTextField(labelWithString: "")
-    private let detailLabel = NSTextField(labelWithString: "")
+    private let titleLabel = NSTextField(wrappingLabelWithString: "")
+    private let detailLabel = NSTextField(wrappingLabelWithString: " ")
     private let bar = NSProgressIndicator()
     private let cancelButton = NSButton(title: "Отмена", target: nil, action: nil)
 
     private var stopped = false
-    private var running = false
+    private var running = false      // блокирующий режим (present)
+    private var shown = false        // неблокирующий режим (show)
+    private weak var sheetParent: NSWindow?
 
     /// Нажата «Отмена».
     var onCancel: (() -> Void)?
@@ -31,12 +33,14 @@ final class ProgressModal: NSObject {
 
         titleLabel.stringValue = message
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        titleLabel.lineBreakMode = .byTruncatingMiddle
-        titleLabel.maximumNumberOfLines = 2
+        titleLabel.lineBreakMode = .byWordWrapping
+        titleLabel.maximumNumberOfLines = 4
+        titleLabel.preferredMaxLayoutWidth = 400
 
         detailLabel.stringValue = " "
         detailLabel.font = .systemFont(ofSize: 12)
         detailLabel.textColor = .secondaryLabelColor
+        detailLabel.preferredMaxLayoutWidth = 400
 
         bar.style = .bar
         bar.isIndeterminate = true
@@ -94,6 +98,17 @@ final class ProgressModal: NSObject {
             bar.startAnimation(nil)
             detailLabel.stringValue = detail ?? " "
         }
+        relayout()
+    }
+
+    /// Подгоняет высоту окна под число строк текста (длинные имена компьютеров переносятся).
+    private func relayout() {
+        guard let content = window.contentView else { return }
+        content.layoutSubtreeIfNeeded()
+        let size = content.fittingSize
+        if abs(size.height - window.contentRect(forFrameRect: window.frame).height) > 1 {
+            window.setContentSize(NSSize(width: 440, height: size.height))
+        }
     }
 
     func setCancelEnabled(_ enabled: Bool) {
@@ -115,9 +130,48 @@ final class ProgressModal: NSObject {
         onClosed?()
     }
 
-    /// Закрывает окно (можно вызывать и до `present()` — тогда окно не покажется).
+    /// Неблокирующий показ: окно-лист поверх главного окна (или плавающее окно, если главного нет).
+    /// Главный цикл событий и очередь main продолжают работать, поэтому `dismiss()` и `update()`
+    /// можно вызывать из любых асинхронных задач на главном потоке.
+    func show() {
+        guard !stopped else {
+            fireClosed()
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let parent = NSApp.windows.first {
+            $0.isVisible && !$0.isMiniaturized && $0.canBecomeMain && !($0 is NSPanel) && $0.attachedSheet == nil
+        }
+        if let parent {
+            sheetParent = parent
+            parent.beginSheet(window, completionHandler: nil)
+        } else {
+            window.center()
+            window.level = .floating
+            window.makeKeyAndOrderFront(nil)
+        }
+        shown = true
+    }
+
+    private func fireClosed() {
+        let callback = onClosed
+        onClosed = nil
+        callback?()
+    }
+
+    /// Закрывает окно (можно вызывать и до `present()` / `show()` — тогда окно не покажется).
     func dismiss() {
         stopped = true
+        if shown {
+            shown = false
+            if let parent = sheetParent {
+                parent.endSheet(window)
+                sheetParent = nil
+            }
+            window.orderOut(nil)
+            fireClosed()
+            return
+        }
         guard running else { return }
         NSApp.stopModal()
         // Будим цикл событий: stopModal, вызванный не из обработчика события, иначе сработает не сразу.

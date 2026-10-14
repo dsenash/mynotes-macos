@@ -288,11 +288,17 @@ extension Store {
 
     // MARK: - Импорт из OneNote (через экспортированные файлы)
 
-    private struct ImportReport {
+    final class ScanBox {
+        var result: ScanResult?
+        var finished = false
+    }
+
+    struct ImportReport {
         var notes = 0
         var projects = 0
         var skipped: [String] = []
         var failed: [String] = []
+        var warnings: [String] = []
     }
 
     func importOneNoteWithPanel() {
@@ -300,13 +306,64 @@ extension Store {
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
-        panel.message = "Выберите файлы или папки, экспортированные из OneNote (.docx, .html, .rtf, .odt, .txt). Папки станут вложенными проектами."
+        panel.message = "Выберите файлы разделов OneNote (.one) или папки с ними. Раздел станет проектом, страница — заметкой. Также подойдут экспортированные .docx, .html, .rtf, .odt, .txt."
         panel.prompt = "Импортировать"
         guard panel.runModal() == .OK else { return }
         importOneNote(urls: panel.urls)
     }
 
     func importOneNote(urls: [URL]) {
+        // 1. Обход папок в фоне, с ограничениями и кнопкой «Отмена»: приложение не зависает
+        //    на недоступных, огромных или системных папках.
+        let scanner = ImportScanner(supportedExtensions: Store.supportedImportExtensions.union(["one"]))
+        let modal = ProgressModal(title: "Импорт из OneNote", message: "Просмотр выбранных файлов и папок…")
+        let box = ScanBox()
+        modal.onCancel = {
+            scanner.cancel()
+            if !box.finished { box.finished = true; modal.dismiss() }
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = scanner.scan(urls)
+            DispatchQueue.main.async {
+                guard !box.finished else { return }
+                box.finished = true
+                box.result = r
+                modal.dismiss()
+            }
+        }
+        // Запасной выход: если файловая система не отвечает, окно закрывается само.
+        DispatchQueue.main.asyncAfter(deadline: .now() + ImportScanner.timeLimit + 5) {
+            guard !box.finished else { return }
+            box.finished = true
+            scanner.cancel()
+            modal.dismiss()
+        }
+        modal.present()
+
+        guard let scan = box.result else {
+            Dialogs.info(
+                title: "Импорт из OneNote",
+                message: "Просмотр папок отменён или занял слишком много времени. Выберите конкретные файлы .one или небольшую папку."
+            )
+            return
+        }
+
+        if scan.fileCount == 0 {
+            var text = "Подходящих файлов не найдено."
+            if !scan.rejected.isEmpty { text += "\n\n" + scan.rejected.prefix(5).joined(separator: "\n") }
+            if !scan.unreadable.isEmpty { text += "\n\nНет доступа: " + scan.unreadable.prefix(8).joined(separator: ", ") }
+            Dialogs.info(title: "Импорт из OneNote", message: text)
+            return
+        }
+        if scan.fileCount > 200 {
+            guard Dialogs.confirm(
+                title: "Импортировать \(scan.fileCount) файлов?",
+                message: "Импорт большого числа файлов может занять несколько минут.",
+                ok: "Импортировать", destructive: false
+            ) else { return }
+        }
+
+        // 2. Сам импорт.
         var report = ImportReport()
         var rootID: UUID?
         attempt {
@@ -316,8 +373,8 @@ extension Store {
                 } else {
                     rootID = try insertProject(name: "OneNote", parent: nil)
                 }
-                for url in urls {
-                    try importItem(url, into: rootID, report: &report)
+                for node in scan.roots {
+                    try importNode(node, into: rootID, report: &report)
                 }
             }
         }
@@ -328,27 +385,45 @@ extension Store {
         if !report.failed.isEmpty {
             text += "\n\nНе удалось прочитать: " + report.failed.prefix(8).joined(separator: ", ")
         }
-        if !report.skipped.isEmpty {
-            text += "\n\nПропущены неподдерживаемые форматы: " + report.skipped.prefix(8).joined(separator: ", ")
-            text += "\nВ OneNote выберите «Файл → Экспорт» и сохраните страницы или разделы как Word (.docx)."
+        if !report.warnings.isEmpty {
+            text += "\n\n" + report.warnings.prefix(8).joined(separator: "\n")
+        }
+        if !scan.rejected.isEmpty {
+            text += "\n\nПропущено: " + scan.rejected.prefix(5).joined(separator: "; ")
+        }
+        if !scan.unreadable.isEmpty {
+            text += "\n\nНет доступа к: " + scan.unreadable.prefix(8).joined(separator: ", ")
+            text += "\nРазрешите доступ в Системные настройки → Конфиденциальность и безопасность → Файлы и папки."
+        }
+        if scan.truncated {
+            text += "\n\nОбход остановлен по лимиту (глубина, число файлов или время): часть файлов не импортирована. Выберите папку поменьше."
+        }
+        if !scan.skipped.isEmpty {
+            text += "\n\nПропущены: " + scan.skipped.prefix(8).joined(separator: ", ")
+            if scan.skipped.contains(where: { $0.lowercased().contains(".onepkg") }) {
+                text += "\nПакеты .onepkg не читаются напрямую — выберите отдельные файлы .one."
+            }
         }
         Dialogs.info(title: "Импорт из OneNote", message: text)
     }
 
-    private func importItem(_ url: URL, into parent: UUID?, report: inout ImportReport) throws {
-        var isDirectory: ObjCBool = false
-        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+    private func importNode(_ node: ScanNode, into parent: UUID?, report: inout ImportReport) throws {
+        if node.isDirectory {
+            let projectID = try insertProject(name: node.url.lastPathComponent, parent: parent)
+            report.projects += 1
+            for child in node.children {
+                try importNode(child, into: projectID, report: &report)
+            }
+        } else {
+            try importFile(node.url, into: parent, report: &report)
+        }
+    }
+
+    private func importFile(_ url: URL, into parent: UUID?, report: inout ImportReport) throws {
         let ext = url.pathExtension.lowercased()
 
-        if isDirectory.boolValue && ext != "rtfd" {
-            let projectID = try insertProject(name: url.lastPathComponent, parent: parent)
-            report.projects += 1
-            let items = (try? FileManager.default.contentsOfDirectory(
-                at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
-            let sorted = items.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-            for item in sorted {
-                try importItem(item, into: projectID, report: &report)
-            }
+        if ext == "one" {
+            try importOneSection(url, into: parent, report: &report)
             return
         }
 

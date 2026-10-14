@@ -4,6 +4,100 @@ import SwiftUI
 // MARK: - Текстовое поле с кликабельными чекбоксами
 
 final class NotesTextView: NSTextView {
+    private var attachmentTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = attachmentTrackingArea { removeTrackingArea(area) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil
+        )
+        addTrackingArea(area)
+        attachmentTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        let tip = attachmentToolTip(at: convert(event.locationInWindow, from: nil))
+        if toolTip != tip { toolTip = tip }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if toolTip != nil { toolTip = nil }
+    }
+
+    /// Вложение под точкой (в координатах вью) или nil.
+    private func attachment(at point: NSPoint) -> NSTextAttachment? {
+        guard let lm = layoutManager, let tc = textContainer, let storage = textStorage, storage.length > 0 else { return nil }
+        let origin = textContainerOrigin
+        let local = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+        var fraction: CGFloat = 0
+        let glyph = lm.glyphIndex(for: local, in: tc, fractionOfDistanceThroughGlyph: &fraction)
+        let idx = lm.characterIndexForGlyph(at: glyph)
+        guard idx < storage.length,
+              let attachment = storage.attribute(.attachment, at: idx, effectiveRange: nil) as? NSTextAttachment else { return nil }
+        let rect = lm.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: tc)
+        guard rect.insetBy(dx: -2, dy: -2).contains(local) else { return nil }
+        return attachment
+    }
+
+    /// Подсказка для вложения под курсором: имя файла и размер.
+    private func attachmentToolTip(at point: NSPoint) -> String? {
+        guard let attachment = attachment(at: point) else { return nil }
+        return Self.describe(attachment)
+    }
+
+    // MARK: Контекстное меню вложения
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let base = super.menu(for: event)
+        guard let attachment = attachment(at: convert(event.locationInWindow, from: nil)),
+              attachment.fileWrapper != nil else { return base }
+        let menu = base ?? NSMenu()
+        let item = NSMenuItem(title: "Сохранить как…", action: #selector(saveAttachmentAs(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = attachment
+        menu.insertItem(item, at: 0)
+        menu.insertItem(.separator(), at: 1)
+        return menu
+    }
+
+    @objc private func saveAttachmentAs(_ sender: NSMenuItem) {
+        guard let attachment = sender.representedObject as? NSTextAttachment,
+              let wrapper = attachment.fileWrapper else { return }
+        let panel = NSSavePanel()
+        panel.title = "Сохранить файл"
+        panel.prompt = "Сохранить"
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = wrapper.preferredFilename ?? wrapper.filename ?? "Файл"
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        guard panel.runModal() == .OK, let target = panel.url else { return }
+        do {
+            try wrapper.write(to: target, options: .atomic, originalContentsURL: nil)
+        } catch {
+            Dialogs.info(title: "Не удалось сохранить файл", message: error.localizedDescription)
+        }
+    }
+
+    static func describe(_ attachment: NSTextAttachment) -> String {
+        guard let wrapper = attachment.fileWrapper else { return "Вложение" }
+        let name = wrapper.preferredFilename ?? wrapper.filename ?? "Без имени"
+        let size = byteCount(of: wrapper)
+        let sizeText = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        return "\(name)\nРазмер: \(sizeText)\nДвойной щелчок — открыть"
+    }
+
+    private static func byteCount(of wrapper: FileWrapper) -> Int64 {
+        if wrapper.isRegularFile { return Int64(wrapper.regularFileContents?.count ?? 0) }
+        if wrapper.isDirectory {
+            return (wrapper.fileWrappers ?? [:]).values.reduce(Int64(0)) { $0 + byteCount(of: $1) }
+        }
+        return 0
+    }
+
     override func mouseDown(with event: NSEvent) {
         if toggleCheckbox(at: convert(event.locationInWindow, from: nil)) { return }
         super.mouseDown(with: event)
@@ -433,6 +527,18 @@ final class EditorController {
         refocus()
     }
 
+    /// Окно рисования курсором; готовый рисунок вставляется в заметку как картинка.
+    func insertDrawing() {
+        guard tv != nil else { return }
+        guard let png = DrawingSheet.run() else { refocus(); return }
+        let wrapper = FileWrapper(regularFileWithContents: png)
+        wrapper.preferredFilename = "Рисунок.png"
+        let attachment = NSTextAttachment(fileWrapper: wrapper)
+        attachment.image = NSImage(data: png)
+        insert(attachment, trailingNewline: true)
+        refocus()
+    }
+
     func insertFiles() {
         guard tv != nil else { return }
         let panel = NSOpenPanel()
@@ -578,6 +684,7 @@ struct FormatBar: View {
             divider
             tool("link", "Ссылка (⌘K)") { c.insertLink() }
             tool("photo", "Вставить изображение (⇧⌘I)") { c.insertImages() }
+            tool("scribble", "Нарисовать рисунок (⌥⌘D)") { c.insertDrawing() }
             tool("paperclip", "Вложить файл (⇧⌘A)") { c.insertFiles() }
             Spacer()
         }
