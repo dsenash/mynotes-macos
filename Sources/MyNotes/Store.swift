@@ -17,6 +17,8 @@ final class Store: ObservableObject {
     @Published var showSidebar = true
     /// true — проекты, помеченные «Скрываемый», скрыты (кнопка с глазом в боковой панели).
     @Published private(set) var hiddenMode = UserDefaults.standard.bool(forKey: "hiddenMode")
+    /// Режим «не показывать устаревшие» (кнопка E).
+    @Published private(set) var expiredMode = UserDefaults.standard.bool(forKey: "expiredMode")
     @Published var sidebarWidth: CGFloat = 270
     @Published var focusSearchTick = 0
 
@@ -69,7 +71,7 @@ final class Store: ObservableObject {
             sortCounter = projects.map(\.sort).max() ?? 0
 
             let loadedNotes = try db.rows(
-                "SELECT id, project_id, title, created, updated FROM notes ORDER BY created DESC"
+                "SELECT id, project_id, title, created, updated, expired FROM notes ORDER BY created DESC"
             ) { (r: Row) -> NoteMeta? in
                 guard let id = r.text(0).flatMap(UUID.init(uuidString:)) else { return nil }
                 return NoteMeta(
@@ -77,7 +79,8 @@ final class Store: ObservableObject {
                     projectID: r.text(1).flatMap(UUID.init(uuidString:)),
                     title: r.text(2) ?? "",
                     created: Date(timeIntervalSince1970: r.real(3)),
-                    updated: Date(timeIntervalSince1970: r.real(4))
+                    updated: Date(timeIntervalSince1970: r.real(4)),
+                    isExpired: r.int(5) != 0
                 )
             }
             notes = loadedNotes.compactMap { $0 }
@@ -99,7 +102,7 @@ final class Store: ObservableObject {
     }
 
     private func restoreTabs() {
-        let known = Set(notes.filter { !isProjectHidden($0.projectID) }.map(\.id))
+        let known = Set(notes.filter { !isNoteHidden($0) }.map(\.id))
         let ids = (UserDefaults.standard.stringArray(forKey: "openTabs") ?? [])
             .compactMap(UUID.init(uuidString:))
             .filter { known.contains($0) }
@@ -113,6 +116,7 @@ final class Store: ObservableObject {
     }
 
     func openNote(_ id: UUID) {
+        if NoteWindows.shared.focus(id) { return }
         guard let meta = notes.first(where: { $0.id == id }) else { return }
         if !openTabs.contains(id) { openTabs.append(id) }
         activeTab = id
@@ -231,16 +235,37 @@ final class Store: ObservableObject {
 
     /// Проект скрыт, если включён режим скрытия и он (или любой его родитель) помечен «Скрываемый».
     func isProjectHidden(_ id: UUID?) -> Bool {
-        guard hiddenMode else { return false }
+        guard hiddenMode || expiredMode else { return false }
         var current = id
         var steps = 0
         while let cid = current, steps < 64 {
             guard let p = projects.first(where: { $0.id == cid }) else { return false }
-            if p.isHideable { return true }
+            if hiddenMode && p.isHideable { return true }
+            if expiredMode && p.isExpired { return true }
             current = p.parentID
             steps += 1
         }
         return false
+    }
+
+    /// Заметка скрыта: скрыт её проект или она сама устарела при включённом режиме E.
+    func isNoteHidden(_ note: NoteMeta) -> Bool {
+        (expiredMode && note.isExpired) || isProjectHidden(note.projectID)
+    }
+
+    func toggleExpiredMode() {
+        expiredMode.toggle()
+        UserDefaults.standard.set(expiredMode, forKey: "expiredMode")
+        afterHiddenChange()
+    }
+
+    func setNoteExpired(_ id: UUID, _ value: Bool) {
+        guard let i = notes.firstIndex(where: { $0.id == id }) else { return }
+        notes[i].isExpired = value
+        attempt {
+            try db.execute("UPDATE notes SET expired = ? WHERE id = ?", [.int(value ? 1 : 0), .text(id.uuidString)])
+        }
+        afterHiddenChange()
     }
 
     func toggleHiddenMode() {
@@ -264,14 +289,29 @@ final class Store: ObservableObject {
         afterHiddenChange()
     }
 
+    /// Метка Expired у проекта или подпапки (красная плашка перед названием).
+    func setProjectExpired(_ id: UUID, _ value: Bool) {
+        guard let i = projects.firstIndex(where: { $0.id == id }) else { return }
+        let style = value ? (projects[i].fontStyle | 8) : (projects[i].fontStyle & ~8)
+        let now = Date()
+        projects[i].fontStyle = style
+        projects[i].updated = now
+        attempt {
+            try db.execute(
+                "UPDATE projects SET font_style = ?, updated = ? WHERE id = ?",
+                [.int(Int64(style)), .real(now.timeIntervalSince1970), .text(id.uuidString)]
+            )
+        }
+    }
+
     /// Скрытые заметки не должны оставаться открытыми во вкладках и в результатах поиска.
     private func afterHiddenChange() {
-        guard hiddenMode else {
+        guard hiddenMode || expiredMode else {
             if !searchText.isEmpty { runSearch() }
             return
         }
         for id in openTabs {
-            if let note = notes.first(where: { $0.id == id }), isProjectHidden(note.projectID) {
+            if let note = notes.first(where: { $0.id == id }), isNoteHidden(note) {
                 closeTab(id)
             }
         }
@@ -390,6 +430,7 @@ final class Store: ObservableObject {
             title: "Удалить заметку «\(title(for: id))»?",
             message: "Это действие нельзя отменить.", ok: "Удалить"
         ) else { return }
+        NoteWindows.shared.close(id)
         closeTab(id)
         attempt { try db.execute("DELETE FROM notes WHERE id = ?", [.text(id.uuidString)]) }
         reload()
@@ -444,10 +485,12 @@ final class Store: ObservableObject {
         func walk(_ parent: UUID?, _ depth: Int) {
             for p in childProjects[parent] ?? [] {
                 if hiddenMode && p.isHideable { continue }
+                if expiredMode && p.isExpired { continue }
                 out.append(.project(p, depth))
                 if expanded.contains(p.id) { walk(p.id, depth + 1) }
             }
             for n in projectNotes[parent] ?? [] {
+                if expiredMode && n.isExpired { continue }
                 out.append(.note(n, depth))
             }
         }
@@ -467,7 +510,7 @@ final class Store: ObservableObject {
         let ids = Set(hits.filter {
             $0.1.localizedCaseInsensitiveContains(query) || $0.2.localizedCaseInsensitiveContains(query)
         }.map { $0.0 })
-        searchResults = notes.filter { ids.contains($0.id.uuidString) && !isProjectHidden($0.projectID) }
+        searchResults = notes.filter { ids.contains($0.id.uuidString) && !isNoteHidden($0) }
     }
 
     func focusSearch() {

@@ -82,6 +82,11 @@ final class Database {
             try script("ALTER TABLE projects ADD COLUMN updated REAL;")
         }
         try script("UPDATE projects SET updated = created WHERE updated IS NULL;")
+        // Миграция 1.10: метка «Устаревшая» у заметок.
+        let noteColumns = try rows("PRAGMA table_info(notes)") { (r: Row) -> String in r.text(1) ?? "" }
+        if !noteColumns.contains("expired") {
+            try script("ALTER TABLE notes ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;")
+        }
     }
 
     deinit { sqlite3_close(handle) }

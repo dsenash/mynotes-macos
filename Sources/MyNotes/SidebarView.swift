@@ -34,6 +34,20 @@ struct WindowDragArea: NSViewRepresentable {
     }
 }
 
+/// Красная плашка с белой надписью EXPIRED.
+struct ExpiredBadge: View {
+    var body: some View {
+        Text("EXPIRED")
+            .font(.system(size: 8.5, weight: .heavy))
+            .tracking(0.4)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 3).fill(Color(red: 0.90, green: 0.12, blue: 0.16)))
+            .fixedSize()
+    }
+}
+
 struct SidebarView: View {
     @ObservedObject var store: Store
     @ObservedObject private var theme = Theme.shared
@@ -118,6 +132,15 @@ struct SidebarView: View {
             .help(store.hiddenMode
                   ? "Скрываемые проекты скрыты. Нажмите, чтобы показать"
                   : "Скрываемые проекты показаны. Нажмите, чтобы скрыть")
+
+            Button { store.toggleExpiredMode() } label: {
+                Image(systemName: store.expiredMode ? "e.circle.fill" : "e.circle")
+                    .foregroundStyle(store.expiredMode ? Color.red : Color.primary)
+            }
+            .buttonStyle(.borderless)
+            .help(store.expiredMode
+                  ? "Устаревшие проекты и заметки скрыты. Нажмите, чтобы показать"
+                  : "Устаревшие проекты и заметки показаны. Нажмите, чтобы скрыть")
 
             Button { store.promptNewProject(parent: nil) } label: {
                 Image(systemName: "folder.badge.plus")
@@ -209,6 +232,9 @@ struct ProjectRowView: View {
 
             Image(systemName: isExpanded ? "folder.fill" : "folder")
                 .foregroundStyle(.secondary)
+            if project.isExpired {
+                ExpiredBadge()
+            }
             Text(project.name)
                 .italic(project.isItalic)
                 .fontWeight(project.isBold ? .bold : .regular)
@@ -281,6 +307,10 @@ struct ProjectRowView: View {
                 Divider()
                 Button("Обычный") { store.setProjectFontStyle(project.id, bold: false, italic: false) }
             }
+            Toggle("Устаревшие", isOn: Binding(
+                get: { project.isExpired },
+                set: { store.setProjectExpired(project.id, $0) }
+            ))
             Toggle("Скрываемый", isOn: Binding(
                 get: { project.isHideable },
                 set: { store.setProjectHideable(project.id, $0) }
@@ -322,8 +352,11 @@ struct NoteRowView: View {
                 .foregroundStyle(.secondary)
                 .padding(.leading, 18)
             VStack(alignment: .leading, spacing: 0) {
-                Text(note.title.isEmpty ? "Новая заметка" : note.title)
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    if note.isExpired { ExpiredBadge() }
+                    Text(note.title.isEmpty ? "Новая заметка" : note.title)
+                        .lineLimit(1)
+                }
                 if showPath, let pid = note.projectID {
                     Text(store.path(of: pid))
                         .font(.caption2)
@@ -343,7 +376,12 @@ struct NoteRowView: View {
         .draggable("note:" + note.id.uuidString)
         .contextMenu {
             Button("Открыть") { store.openNote(note.id) }
+            Button("Открыть в отдельном окне") { NoteWindows.shared.open(note.id) }
             Button("Дублировать") { store.duplicateNote(note.id) }
+            Toggle("Устаревшие", isOn: Binding(
+                get: { note.isExpired },
+                set: { store.setNoteExpired(note.id, $0) }
+            ))
             Menu("Переместить в") {
                 Button("Верхний уровень") { store.moveNote(note.id, to: nil) }
                 ForEach(store.projects) { target in

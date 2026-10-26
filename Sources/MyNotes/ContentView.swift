@@ -141,6 +141,8 @@ struct TabItemView: View {
         .onTapGesture { store.activeTab = id }
         .onHover { hover = $0 }
         .contextMenu {
+            Button("Открыть в отдельном окне") { NoteWindows.shared.open(id) }
+            Divider()
             Button("Закрыть вкладку") { store.closeTab(id) }
             Button("Закрыть остальные") { store.closeOtherTabs(except: id) }
             Button("Закрыть все") { store.closeAllTabs() }

@@ -6,6 +6,36 @@ import SwiftUI
 final class NotesTextView: NSTextView {
     private var attachmentTrackingArea: NSTrackingArea?
 
+    // Команды форматирования действуют на тот редактор, в котором пользователь работает сейчас.
+    private func claimController() {
+        if let coordinator = delegate as? EditorCoordinator {
+            EditorController.shared.current = coordinator
+        }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok { claimController() }
+        return ok
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
+        if let window {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(windowBecameKey), name: NSWindow.didBecomeKeyNotification, object: window)
+        }
+    }
+
+    @objc private func windowBecameKey() {
+        if window?.firstResponder === self { claimController() }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let area = attachmentTrackingArea { removeTrackingArea(area) }
@@ -39,6 +69,7 @@ final class NotesTextView: NSTextView {
         let idx = lm.characterIndexForGlyph(at: glyph)
         guard idx < storage.length,
               let attachment = storage.attribute(.attachment, at: idx, effectiveRange: nil) as? NSTextAttachment else { return nil }
+        guard !NotesTextView.isBadge(attachment) else { return nil }
         let rect = lm.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: tc)
         guard rect.insetBy(dx: -2, dy: -2).contains(local) else { return nil }
         return attachment
@@ -54,15 +85,186 @@ final class NotesTextView: NSTextView {
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let base = super.menu(for: event)
-        guard let attachment = attachment(at: convert(event.locationInWindow, from: nil)),
-              attachment.fileWrapper != nil else { return base }
-        let menu = base ?? NSMenu()
-        let item = NSMenuItem(title: "Сохранить как…", action: #selector(saveAttachmentAs(_:)), keyEquivalent: "")
-        item.target = self
-        item.representedObject = attachment
-        menu.insertItem(item, at: 0)
-        menu.insertItem(.separator(), at: 1)
-        return menu
+        let point = convert(event.locationInWindow, from: nil)
+
+        if let attachment = attachment(at: point), attachment.fileWrapper != nil {
+            let menu = base ?? NSMenu()
+            let item = NSMenuItem(title: "Сохранить как…", action: #selector(saveAttachmentAs(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = attachment
+            menu.insertItem(item, at: 0)
+            menu.insertItem(.separator(), at: 1)
+            return menu
+        }
+
+        if let range = taskParagraph(at: point) {
+            let menu = base ?? NSMenu()
+            addTaskItems(to: menu, paragraph: range)
+            return menu
+        }
+        return base
+    }
+
+    // MARK: Задачи: цвет и значок «просрочена»
+
+    /// Значок «EXPIRED» (белая надпись на красном фоне) перед текстом задачи — вложение-картинка.
+    static let badgeFileName = "expired-badge.png"
+    /// Прежний текстовый значок из версии 1.7 — по-прежнему распознаётся.
+    static let legacyMarker = "⏰\u{2009}"
+
+    static func isBadge(_ attachment: NSTextAttachment) -> Bool {
+        attachment.fileWrapper?.preferredFilename == badgeFileName
+    }
+
+    static func makeBadge() -> NSTextAttachment {
+        let size = NSSize(width: 56, height: 16)
+        var png: Data?
+        if let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 112, pixelsHigh: 32, bitsPerSample: 8, samplesPerPixel: 4,
+            hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) {
+            rep.size = size
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            NSColor(srgbRed: 0.90, green: 0.12, blue: 0.16, alpha: 1).setFill()
+            NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 3, yRadius: 3).fill()
+            let text = NSAttributedString(string: "EXPIRED", attributes: [
+                .font: NSFont.systemFont(ofSize: 9.5, weight: .heavy),
+                .foregroundColor: NSColor.white,
+                .kern: 0.6
+            ])
+            let textSize = text.size()
+            text.draw(at: NSPoint(x: (size.width - textSize.width) / 2, y: (size.height - textSize.height) / 2))
+            NSGraphicsContext.restoreGraphicsState()
+            png = rep.representation(using: .png, properties: [:])
+        }
+        let wrapper = FileWrapper(regularFileWithContents: png ?? Data())
+        wrapper.preferredFilename = badgeFileName
+        let attachment = NSTextAttachment(fileWrapper: wrapper)
+        if let png { attachment.image = NSImage(data: png) }
+        attachment.bounds = CGRect(x: 0, y: -3, width: size.width, height: size.height)
+        return attachment
+    }
+
+    private final class TaskPayload: NSObject {
+        let range: NSRange
+        let color: NSColor?
+        init(range: NSRange, color: NSColor?) {
+            self.range = range
+            self.color = color
+        }
+    }
+
+    /// Позиции в абзаце-задаче: индекс чекбокса «☐»/«☑» и начало текста за ним.
+    /// Перед чекбоксом допускаются пробелы, табуляции, маркеры и номера списка.
+    private func taskLayout(in paragraph: NSRange) -> (checkbox: Int, textStart: Int)? {
+        let ns = string as NSString
+        let end = min(NSMaxRange(paragraph), ns.length)
+        let limit = min(end, paragraph.location + 16)
+        var i = paragraph.location
+        while i < limit {
+            let c = ns.character(at: i)
+            if c == 0x2610 || c == 0x2611 {
+                var start = i + 1
+                if start < ns.length, ns.character(at: start) == 9 || ns.character(at: start) == 32 { start += 1 }
+                return (i, start)
+            }
+            let allowed = c == 9 || c == 32 || c == 46 || c == 0x2022 || (c >= 48 && c <= 57)
+            if !allowed { return nil }
+            i += 1
+        }
+        return nil
+    }
+
+    /// Диапазон абзаца-задачи под точкой или nil.
+    private func taskParagraph(at point: NSPoint) -> NSRange? {
+        guard let lm = layoutManager, let tc = textContainer, let storage = textStorage, storage.length > 0 else { return nil }
+        let origin = textContainerOrigin
+        let local = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+        let glyph = lm.glyphIndex(for: local, in: tc)
+        let lineRect = lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        guard local.y >= lineRect.minY - 4, local.y <= lineRect.maxY + 4 else { return nil }
+        let idx = lm.characterIndexForGlyph(at: glyph)
+        let ns = string as NSString
+        guard idx < ns.length else { return nil }
+        let paragraph = ns.paragraphRange(for: NSRange(location: idx, length: 0))
+        return taskLayout(in: paragraph) != nil ? paragraph : nil
+    }
+
+    private func hasExpiredMarker(_ paragraph: NSRange) -> Bool {
+        guard let storage = textStorage, let layout = taskLayout(in: paragraph) else { return false }
+        let pos = layout.textStart
+        guard pos < storage.length else { return false }
+        if let attachment = storage.attribute(.attachment, at: pos, effectiveRange: nil) as? NSTextAttachment,
+           NotesTextView.isBadge(attachment) {
+            return true
+        }
+        let legacyLength = NotesTextView.legacyMarker.utf16.count
+        guard pos + legacyLength <= storage.length else { return false }
+        return (string as NSString).substring(with: NSRange(location: pos, length: legacyLength)) == NotesTextView.legacyMarker
+    }
+
+    private func addTaskItems(to menu: NSMenu, paragraph: NSRange) {
+        let colors = NSMenu()
+        let reset = NSMenuItem(title: "По умолчанию", action: #selector(setTaskColor(_:)), keyEquivalent: "")
+        reset.target = self
+        reset.representedObject = TaskPayload(range: paragraph, color: nil)
+        colors.addItem(reset)
+        colors.addItem(.separator())
+        for preset in Palette.presets {
+            let item = NSMenuItem(title: preset.name, action: #selector(setTaskColor(_:)), keyEquivalent: "")
+            item.target = self
+            item.image = ColorSwatch.image(preset.color)
+            item.representedObject = TaskPayload(range: paragraph, color: preset.color)
+            colors.addItem(item)
+        }
+        let colorItem = NSMenuItem(title: "Цвет задачи", action: nil, keyEquivalent: "")
+        colorItem.submenu = colors
+
+        let expired = NSMenuItem(title: "Устаревшая", action: #selector(toggleTaskExpired(_:)), keyEquivalent: "")
+        expired.target = self
+        expired.state = hasExpiredMarker(paragraph) ? .on : .off
+        expired.representedObject = TaskPayload(range: paragraph, color: nil)
+
+        menu.insertItem(colorItem, at: 0)
+        menu.insertItem(expired, at: 1)
+        menu.insertItem(.separator(), at: 2)
+    }
+
+    @objc private func setTaskColor(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? TaskPayload, let storage = textStorage else { return }
+        var range = payload.range
+        let ns = string as NSString
+        guard NSMaxRange(range) <= ns.length else { return }
+        if range.length > 0, ns.character(at: NSMaxRange(range) - 1) == 10 { range.length -= 1 }
+        guard range.length > 0, shouldChangeText(in: range, replacementString: nil) else { return }
+        storage.addAttribute(.foregroundColor, value: payload.color ?? NSColor.labelColor, range: range)
+        didChangeText()
+    }
+
+    @objc private func toggleTaskExpired(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? TaskPayload, let storage = textStorage else { return }
+        let paragraph = payload.range
+        guard let layout = taskLayout(in: paragraph) else { return }
+        let pos = layout.textStart
+        guard pos <= storage.length else { return }
+
+        if hasExpiredMarker(paragraph) {
+            // Значок и пробел после него (две позиции) — и для новой картинки, и для прежнего ⏰.
+            let range = NSRange(location: pos, length: min(2, storage.length - pos))
+            guard shouldChangeText(in: range, replacementString: "") else { return }
+            storage.deleteCharacters(in: range)
+        } else {
+            let insertion = NSRange(location: pos, length: 0)
+            guard shouldChangeText(in: insertion, replacementString: nil) else { return }
+            var attrs = storage.attributes(at: min(layout.checkbox, storage.length - 1), effectiveRange: nil)
+            attrs.removeValue(forKey: .attachment)
+            attrs.removeValue(forKey: .link)
+            let badge = NSMutableAttributedString(attachment: NotesTextView.makeBadge())
+            badge.append(NSAttributedString(string: " ", attributes: attrs))
+            storage.insert(badge, at: pos)
+        }
+        didChangeText()
     }
 
     @objc private func saveAttachmentAs(_ sender: NSMenuItem) {
@@ -134,8 +336,19 @@ final class EditorCoordinator: NSObject, NSTextViewDelegate {
     private var dirty = false
     private var work: DispatchWorkItem?
 
+    /// Все открытые редакторы (во вкладке и в отдельных окнах).
+    private static let registry = NSHashTable<EditorCoordinator>.weakObjects()
+
     init(noteID: UUID) {
         self.noteID = noteID
+        super.init()
+        EditorCoordinator.registry.add(self)
+    }
+
+    static func flushAll(noteID: UUID? = nil) {
+        for c in registry.allObjects where noteID == nil || c.noteID == noteID {
+            c.flush()
+        }
     }
 
     func load(into tv: NSTextView) {
@@ -172,7 +385,8 @@ final class EditorCoordinator: NSObject, NSTextViewDelegate {
     func textView(_ textView: NSTextView, doubleClickedOn cell: any NSTextAttachmentCellProtocol, in cellFrame: NSRect, at charIndex: Int) {
         guard let storage = textView.textStorage, charIndex < storage.length,
               let attachment = storage.attribute(.attachment, at: charIndex, effectiveRange: nil) as? NSTextAttachment,
-              let wrapper = attachment.fileWrapper else { return }
+              let wrapper = attachment.fileWrapper,
+              !NotesTextView.isBadge(attachment) else { return }
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("MyNotes-open", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -212,7 +426,58 @@ final class EditorCoordinator: NSObject, NSTextViewDelegate {
             }
             return true
         }
+
+        // Нумерованный список: «1.⇥», «2.⇥» …
+        if let m = line.range(of: #"^\d+\.\t"#, options: .regularExpression) {
+            let markerText = String(line[m])
+            let len = markerText.utf16.count
+            guard sel.location >= pr.location + len else { return false }
+            let content = line.trimmingCharacters(in: .newlines)
+            if content == markerText {
+                let r = NSRange(location: pr.location, length: len)
+                if textView.shouldChangeText(in: r, replacementString: "") {
+                    textView.textStorage?.replaceCharacters(in: r, with: "")
+                    textView.textStorage?.removeAttribute(.paragraphStyle, range: NSRange(location: pr.location, length: max(0, pr.length - len)))
+                    textView.didChangeText()
+                }
+            } else {
+                let number = (Int(markerText.dropLast(2)) ?? 0) + 1
+                textView.insertText("\n\(number).\t", replacementRange: sel)
+                renumber(in: textView, fromParagraphAt: sel.location + 1, firstNumber: number)
+            }
+            return true
+        }
         return false
+    }
+
+    /// После вставки пункта пересчитывает номера следующих подряд идущих пунктов списка.
+    private func renumber(in tv: NSTextView, fromParagraphAt location: Int, firstNumber: Int) {
+        guard let storage = tv.textStorage else { return }
+        var ns = storage.string as NSString
+        guard location < ns.length else { return }
+        var number = firstNumber
+        var paragraph = ns.paragraphRange(for: NSRange(location: location, length: 0))
+        var isFirst = true
+        var changed = false
+        while true {
+            let line = ns.substring(with: paragraph)
+            guard let m = line.range(of: #"^\d+\.\t"#, options: .regularExpression) else { break }
+            if !isFirst {
+                let digits = String(line[m].dropLast(2))
+                if digits != String(number) {
+                    storage.replaceCharacters(in: NSRange(location: paragraph.location, length: digits.utf16.count), with: String(number))
+                    ns = storage.string as NSString
+                    paragraph = ns.paragraphRange(for: NSRange(location: paragraph.location, length: 0))
+                    changed = true
+                }
+            }
+            isFirst = false
+            number += 1
+            let next = NSMaxRange(paragraph)
+            guard next < ns.length else { break }
+            paragraph = ns.paragraphRange(for: NSRange(location: next, length: 0))
+        }
+        if changed { tv.didChangeText() }
     }
 }
 
@@ -292,7 +557,7 @@ final class EditorController {
 
     private var tv: NSTextView? { current?.textView }
 
-    func flushCurrent() { current?.flush() }
+    func flushCurrent() { EditorCoordinator.flushAll() }
 
     private func refocus() {
         if let tv { tv.window?.makeFirstResponder(tv) }
@@ -479,6 +744,78 @@ final class EditorController {
                 attrs.removeValue(forKey: .attachment)
                 attrs.removeValue(forKey: .link)
                 storage.insert(NSAttributedString(string: prefix, attributes: attrs), at: r.location)
+                let current = (storage.string as NSString).paragraphRange(for: NSRange(location: r.location, length: 0))
+                storage.addAttribute(.paragraphStyle, value: style, range: current)
+            }
+        }
+        storage.endEditing()
+        tv.didChangeText()
+        refocus()
+    }
+
+    /// Нумерованный список: «1.⇥», «2.⇥» … Повторное нажатие снимает нумерацию.
+    func toggleNumbers() {
+        guard let tv, let storage = tv.textStorage else { return }
+        let ranges = paragraphRanges(in: tv)
+        let ns = tv.string as NSString
+
+        func markerLength(_ r: NSRange) -> Int {
+            guard r.length > 0 else { return 0 }
+            let line = ns.substring(with: r)
+            guard let m = line.range(of: #"^\d+\.\t"#, options: .regularExpression) else { return 0 }
+            return line[m].utf16.count
+        }
+
+        let allHave = ranges.allSatisfy { markerLength($0) > 0 }
+        let total = NSRange(location: ranges[0].location, length: NSMaxRange(ranges[ranges.count - 1]) - ranges[0].location)
+        guard tv.shouldChangeText(in: total, replacementString: nil) else { return }
+
+        // Если выше есть нумерованный пункт, продолжаем его нумерацию.
+        // Одна пустая строка между списками не мешает, две и больше — нумерация начинается с 1.
+        var start = 1
+        if !allHave, ranges[0].location > 0 {
+            var location = ranges[0].location
+            var blanks = 0
+            while location > 0 {
+                let prev = ns.paragraphRange(for: NSRange(location: location - 1, length: 0))
+                let line = ns.substring(with: prev)
+                if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    blanks += 1
+                    location = prev.location
+                    if blanks >= 2 { break }
+                    continue
+                }
+                if let m = line.range(of: #"^\d+\.\t"#, options: .regularExpression),
+                   let n = Int(line[m].dropLast(2)) {
+                    start = n + 1
+                }
+                break
+            }
+        }
+
+        let style = NSMutableParagraphStyle()
+        style.headIndent = 28
+        style.firstLineHeadIndent = 0
+        style.tabStops = [NSTextTab(textAlignment: .left, location: 28)]
+        style.defaultTabInterval = 28
+
+        storage.beginEditing()
+        for (i, r) in ranges.enumerated().reversed() {
+            if allHave {
+                storage.deleteCharacters(in: NSRange(location: r.location, length: markerLength(r)))
+                let current = (storage.string as NSString).paragraphRange(for: NSRange(location: min(r.location, storage.length), length: 0))
+                if current.length > 0 { storage.removeAttribute(.paragraphStyle, range: current) }
+            } else {
+                if markerLength(r) > 0 { continue }
+                var attrs: [NSAttributedString.Key: Any]
+                if r.length > 0 && r.location < storage.length {
+                    attrs = storage.attributes(at: r.location, effectiveRange: nil)
+                } else {
+                    attrs = tv.typingAttributes
+                }
+                attrs.removeValue(forKey: .attachment)
+                attrs.removeValue(forKey: .link)
+                storage.insert(NSAttributedString(string: "\(start + i).\t", attributes: attrs), at: r.location)
                 let current = (storage.string as NSString).paragraphRange(for: NSRange(location: r.location, length: 0))
                 storage.addAttribute(.paragraphStyle, value: style, range: current)
             }
@@ -676,6 +1013,7 @@ struct FormatBar: View {
             TextColorButton(controller: c)
             divider
             tool("list.bullet", "Маркированный список (⇧⌘8)") { c.toggleBullets() }
+            tool("list.number", "Нумерованный список (⇧⌘9)") { c.toggleNumbers() }
             tool("checklist", "Список задач (⇧⌘7)") { c.toggleChecklist() }
             divider
             tool("text.alignleft", "По левому краю") { c.alignLeft() }

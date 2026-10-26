@@ -7,7 +7,7 @@ struct Project: Identifiable, Hashable {
     var sort: Int
     var created: Date
     var colorHex: String? = nil
-    /// Битовая маска: 1 — жирный, 2 — курсив (начертание названия), 4 — «скрываемый» проект.
+    /// Битовая маска: 1 — жирный, 2 — курсив (начертание названия), 4 — «скрываемый» проект, 8 — метка Expired.
     var fontStyle: Int = 0
     /// Время последнего изменения (для слияния при синхронизации).
     var updated: Date = Date(timeIntervalSince1970: 0)
@@ -15,6 +15,7 @@ struct Project: Identifiable, Hashable {
     var isBold: Bool { fontStyle & 1 != 0 }
     var isItalic: Bool { fontStyle & 2 != 0 }
     var isHideable: Bool { fontStyle & 4 != 0 }
+    var isExpired: Bool { fontStyle & 8 != 0 }
 }
 
 struct NoteMeta: Identifiable, Hashable {
@@ -23,6 +24,7 @@ struct NoteMeta: Identifiable, Hashable {
     var title: String
     var created: Date
     var updated: Date
+    var isExpired: Bool = false
 }
 
 enum SidebarRow: Identifiable {

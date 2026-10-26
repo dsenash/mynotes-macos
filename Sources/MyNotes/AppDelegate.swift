@@ -96,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func applyThemeAppearance() {
         window?.appearance = Theme.shared.forcedAppearance
+        NoteWindows.shared.applyAppearance()
     }
 
     @objc private func showAbout() {
@@ -273,6 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             item("Основной текст", #selector(fmtBody), "0", [.command, .option]),
             .separator(),
             item("Маркированный список", #selector(fmtBullets), "8", [.command, .shift]),
+            item("Нумерованный список", #selector(fmtNumbers), "9", [.command, .shift]),
             item("Список задач", #selector(fmtChecklist), "7", [.command, .shift]),
             .separator(),
             item("По левому краю", #selector(fmtAlignLeft)),
@@ -345,6 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc private func fmtBody() { editor.setStyle(.body) }
     @objc private func fmtBullets() { editor.toggleBullets() }
     @objc private func fmtChecklist() { editor.toggleChecklist() }
+    @objc private func fmtNumbers() { editor.toggleNumbers() }
     @objc private func fmtAlignLeft() { editor.alignLeft() }
     @objc private func fmtAlignCenter() { editor.alignCenter() }
     @objc private func fmtAlignRight() { editor.alignRight() }
@@ -364,9 +367,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return !SyncClient.shared.isRunning
         case #selector(fmtBold), #selector(fmtItalic), #selector(fmtUnderline), #selector(fmtStrike),
              #selector(fmtTitle), #selector(fmtHeading), #selector(fmtSubheading), #selector(fmtBody),
-             #selector(fmtBullets), #selector(fmtChecklist), #selector(fmtAlignLeft), #selector(fmtAlignCenter),
+             #selector(fmtBullets), #selector(fmtChecklist), #selector(fmtNumbers), #selector(fmtAlignLeft), #selector(fmtAlignCenter),
              #selector(fmtAlignRight), #selector(fmtLink), #selector(fmtImage), #selector(fmtFile), #selector(fmtDrawing):
-            return store.activeTab != nil
+            return EditorController.shared.current?.textView?.window != nil
         default:
             return true
         }
